@@ -128,6 +128,7 @@ class Scheduler:
         Returns:
             list[bool]: List indicating which sequences finished (not used in this implementation)
         """
+        status = []
         for seq, token_id in zip(seqs, token_ids):
             # Add the generated token to the sequence
             seq.append_token(token_id)
@@ -140,3 +141,10 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)  # Free KV cache blocks
                 self.running.remove(seq)            # Remove from running queue
+
+                # Append status
+                status.append(True)
+            else:
+                status.append(False)
+        
+        return status

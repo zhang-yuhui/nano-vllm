@@ -83,6 +83,7 @@ def main():
         while requests_sent < NUM_REQUESTS or not engine.is_finished():
             # --- Send new requests ---
             current_time = time.perf_counter()
+            # if it is time for the new request to arrives, send the request and record the time
             while requests_sent < NUM_REQUESTS and current_time - start_time >= arrival_times[requests_sent]:
                 prompt = prompts[requests_sent]
                 sp = sampling_params[requests_sent]
@@ -96,9 +97,9 @@ def main():
                 metrics[seq_id] = req_metrics
                 requests_sent += 1
 
-            # --- Engine step ---
+            # --- Engine steep ---
             if engine.scheduler.waiting or engine.scheduler.running:
-                finished_outputs, _ = engine.step()
+                finished_outputs, _ = engine.step() # no need for `num_tokens`
 
                 # Record first token time for all processed sequences
                 all_processed_seqs = list(engine.scheduler.running)
