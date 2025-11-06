@@ -2,6 +2,9 @@ import torch
 from torch import nn
 import triton
 import triton.language as tl
+from itertools import count
+from torch import Tensor
+from time import sleep
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
@@ -105,6 +108,9 @@ class Attention(nn.Module):
         
         # Initialize empty KV caches - will be allocated by the engine
         self.k_cache = self.v_cache = torch.tensor([])
+        self.k_cache_cpu = {}
+        self.v_cache_cpu = {}
+        self.counter = count()
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         """
@@ -133,10 +139,32 @@ class Attention(nn.Module):
         # Get execution context containing batch metadata and memory mappings
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
+        cache_infos = context.cache_infos
         
         # Store new key-value pairs in cache if cache is allocated
         if k_cache.numel() and v_cache.numel():
+            cpu_idx = [i for (i, cache_location) in enumerate(cache_infos) if cache_location != -1]
+            if len(cpu_idx) == 0:
+                pass
+            elif context.is_prefill:
+                # store cache also in cpu
+                for idx in cpu_idx:
+                    start = context.cu_seqlens_k[idx]
+                    end = context.cu_seqlens_k[idx + 1]
+                    k_cache_cpu = k[start: end].to("cpu")
+                    v_cache_cpu = v[start: end].to("cpu")
+                    self.store_kv_cache_cpu(k_cache_cpu, v_cache_cpu, [cache_infos[idx]], prefill=True)
+                k_cache_cpu = k[cpu_idx]
+            
+            # decoding
+            else:
+                k_cpu = k[cpu_idx].to("cpu")
+                v_cpu = v[cpu_idx].to("cpu")
+                self.store_kv_cache_cpu(k_cpu, v_cpu, [i for i in cache_infos if i != -1], prefill=False)
+
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            # if context.is_prefill:
+            #     print("prefill--------")
         
         if context.is_prefill:
             # PREFILL: Processing new input tokens (first forward pass)
@@ -150,10 +178,97 @@ class Attention(nn.Module):
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+            #print(f"cu seq len: {context.cu_seqlens_k.to('cpu')}")
         else:    # DECODE: Generating next token
             # Use KV-cache optimized FlashAttention for decode
             # Only processes the new query token, reuses all cached KV
+
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                         cache_seqlens=context.context_lens, block_table=context.block_tables, 
                                         softmax_scale=self.scale, causal=True)
+            #print(f"k_cache shape decoding: {k_cache.shape}, q shape: {q.shape}, o shape: {o.shape}")
+
+            # load cpu cache and calculate attention
+            o_cpu = torch.empty(0, 1, q.shape[-2], k.shape[-1]).to(o.device)
+            for i, cache_info in enumerate(cache_infos):
+                if cache_info == -1:
+                    continue
+                k_cpu, v_cpu = self.load_kv_cache_cpu(cache_info)
+                assert torch.equal(k_cpu[-1], k[i].to("cpu")), k_cpu.shape[0]
+                o_one = self.attention_cpu(q[i].to("cpu"), k_cpu, v_cpu, self.scale).to(o.device)
+                #print(f"virefication of attention for seq {i}: {torch.allclose(o[i], o_one, rtol=1e-2, atol=1e-2)}")
+                o_cpu = torch.cat([o_cpu, o_one.unsqueeze(0)], dim=0)
+                o[i] = o_one
+                
+
+            #print(f"cpu attention shape: {o_cpu.shape}")
+
+            # o shape: [seq_len, 1, num_q_heads, head_dim]
         return o
+    
+    def store_kv_cache_cpu(self, k: Tensor, v: Tensor, slot_mapping: list[int], prefill: bool):
+        """
+        k_cache: [seq_len, num_heads, head_dim]
+        k: same
+        """
+        assert len(slot_mapping) > 0
+        for i, id in enumerate(slot_mapping):
+            if id not in self.k_cache_cpu:
+                assert prefill, id
+                self.k_cache_cpu[id] = k
+                self.v_cache_cpu[id] = v
+            else:
+                assert not prefill
+                self.k_cache_cpu[id] = torch.cat([self.k_cache_cpu[id], k[i].unsqueeze(0)], dim=0)
+                self.v_cache_cpu[id] = torch.cat([self.v_cache_cpu[id], v[i].unsqueeze(0)], dim=0)
+
+    def load_kv_cache_cpu(self, id):
+        if id not in self.k_cache_cpu:
+            return None
+        return self.k_cache_cpu[id], self.v_cache_cpu[id]
+
+    def attention_cpu(self, q: torch.Tensor, k_cache, v_cache, softmax_scale) -> torch.Tensor:
+        """
+        do attention for only 1 seq
+        q: [1, num_heads (16), head_dim (128)]
+        k_cache_cpu: [seq_len, num_heads (8), head_dim(128)]
+        output: [hum_heads, head_dim], no flatten now
+        """
+        # extract k and v from cache
+
+                # Verify shapes match expectations
+        assert q.shape == (16, 128)
+        assert k_cache.shape[1] == 8  # Or is it [1, seq_len, 8, 128]?
+        num_q_heads = q.shape[-2]
+        head_dim = q.shape[-1]
+        num_kv_heads = k_cache.shape[-2]
+
+        num_groups = num_q_heads // num_kv_heads # should be 2
+
+        assert num_groups == 2
+        assert k_cache.shape[-1] == v_cache.shape[-1] == head_dim
+
+        # Reshape Q for grouped attention
+        # [1, 16, 128] -> [8, 2, 128]
+        q = q.view(num_kv_heads, num_groups, head_dim).float()
+        
+        # Reshape K, V
+        # [total_len, 8, 128] -> [8, total_len, 128]
+        k = k_cache.transpose(-3, -2).float()
+        v = v_cache.transpose(-3, -2).float()
+        
+        # Compute attention scores
+        # [8, 2, 128] @ [8, 128, total_len] -> [8, 2, total_len]
+        scores = torch.matmul(q, k.transpose(-2, -1)) * softmax_scale
+        
+        # Softmax
+        attn_weights = torch.nn.functional.softmax(scores, dim=-1)  # [8, 2, total_len]
+        
+        # Weighted sum
+        # [8, 2, total_len] @ [8, total_len, 128] -> [8, 2, 128]
+        output = torch.matmul(attn_weights, v)
+        
+        # Reshape output
+        # [8, 2, 128] -> [16, 128]
+        output = output.reshape(1, num_q_heads, head_dim).bfloat16()
+        return output

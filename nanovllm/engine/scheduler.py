@@ -51,7 +51,10 @@ class Scheduler:
         scheduled_seqs = []
         num_seqs = 0
         num_batched_tokens = 0
-        
+        """
+        [1, 2, 3]
+        [3]
+        """
         # PHASE 1: PREFILL - Process new sequences from waiting queue
         while self.waiting and num_seqs < self.max_num_seqs:
             seq = self.waiting[0]
@@ -67,6 +70,9 @@ class Scheduler:
             self.block_manager.allocate(seq)  # Allocate KV cache blocks
             num_batched_tokens += len(seq) - seq.num_cached_tokens  # Count new tokens (excluding cached)
             seq.status = SequenceStatus.RUNNING
+            if seq.seq_id == 1:
+                seq.cache_location = 'cpu'
+                seq.cache_info = 1
             self.waiting.popleft()
             self.running.append(seq)
             scheduled_seqs.append(seq)

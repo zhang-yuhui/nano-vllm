@@ -193,8 +193,10 @@ class ModelRunner:
         max_seqlen_k = 0    # Maximum key sequence length
         slot_mapping = []   # Mapping of tokens to KV cache slots
         block_tables = None
+        cache_infos = []
 
         for seq in seqs:
+            cache_infos.append(seq.cache_info)
             seqlen = len(seq)  # Total sequence length
             # Extract tokens that aren't yet cached (new tokens to process)
             input_ids.extend(seq[seq.num_cached_tokens:])
@@ -234,7 +236,7 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
         # Set context for efficient attention computation with FlashAttention
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, cache_infos)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -245,8 +247,10 @@ class ModelRunner:
         positions = []      # Position of last token in each sequence
         slot_mapping = []   # KV cache slot for storing new token
         context_lens = []   # Context length for each sequence
+        cache_infos = []
 
         for seq in seqs:
+            cache_infos.append(seq.cache_info)
             input_ids.append(seq.last_token)  # Most recently generated token
             positions.append(len(seq) - 1)    # Position = sequence length - 1
             context_lens.append(len(seq))     # Full sequence length as context
@@ -261,7 +265,7 @@ class ModelRunner:
         block_tables = self.prepare_block_tables(seqs)
 
         # Set context for decode phase (single token per sequence)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, cache_infos=cache_infos)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
