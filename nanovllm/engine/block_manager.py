@@ -1,15 +1,10 @@
 from collections import deque
 import xxhash
 import numpy as np
-from enum import Enum
 from typing import Optional
 
+from nanovllm.engine.block_location import BlockLocation
 from nanovllm.engine.sequence import Sequence
-
-
-class BlockLocation(Enum):
-    GPU = "gpu"
-    CPU = "cpu"
 
 
 class Block:
@@ -53,6 +48,9 @@ class BlockManager:
         
         # Default block size (for compatibility)
         self.block_size = self.gpu_block_size
+
+        if num_cpu_blocks != 0 and cpu_block_size is not None:
+            print(f"using cpu cache", num_cpu_blocks, cpu_block_size)
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -101,6 +99,8 @@ class BlockManager:
     def can_allocate(self, seq: Sequence, location: BlockLocation = BlockLocation.GPU) -> bool:
         """Check if sequence can be allocated on specified device"""
         free_ids = self._get_free_ids(location)
+        # if location == BlockLocation.CPU:
+        #     print(len(free_ids))
         return len(free_ids) >= seq.num_blocks
 
     def allocate(self, seq: Sequence, location: BlockLocation = BlockLocation.GPU):

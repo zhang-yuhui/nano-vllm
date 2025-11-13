@@ -7,6 +7,7 @@ from torch import Tensor
 from time import sleep
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from nanovllm.engine.block_location import BlockLocation
 from nanovllm.utils.context import get_context
 
 
@@ -75,11 +76,87 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     assert key.stride(-1) == 1 and value.stride(-1) == 1  # Contiguous in last dim
     assert key.stride(1) == head_dim and value.stride(1) == head_dim  # Proper head stride
     assert k_cache.stride(1) == D and v_cache.stride(1) == D  # Cache layout
-    assert slot_mapping.numel() == N  # One slot mapping per sequence position
+    assert slot_mapping.numel() == N, f"slot_mapping.numel() != N, {slot_mapping.numel()} != {N}"  # One slot mapping per sequence position
     
     # Launch Triton kernel with N parallel threads (one per sequence position)
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
+
+def store_kvcache_cpu(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
+    """
+    CPU version of store_kvcache.
+    
+    Simple sequential implementation that stores key-value pairs into the KV cache
+    based on slot mapping. Unlike the Triton version, this operates on CPU tensors
+    and processes each position sequentially without parallelization.
+    
+    Args:
+        key: Key tensor of shape (N, num_heads, head_dim)
+        value: Value tensor of shape (N, num_heads, head_dim)
+        k_cache: Key cache storage of shape (num_blocks, block_size, num_heads, head_dim)
+        v_cache: Value cache storage of shape (num_blocks, block_size, num_heads, head_dim)
+        slot_mapping: Mapping from sequence position to cache slot (absolute position), shape (N,)
+    """
+    N, num_heads, head_dim = key.shape
+    block_size = k_cache.shape[1]  # Get block_size from cache shape
+    
+    for idx in range(N):
+        slot = slot_mapping[idx].item()
+        if slot == -1:
+            continue  # Skip invalid slots (e.g., padding tokens)
+        
+        # Convert absolute slot to block index and position within block
+        block_idx = slot // block_size
+        pos_in_block = slot % block_size
+        
+        # Store key and value at the correct block and position
+        k_cache[block_idx, pos_in_block] = key[idx]
+        v_cache[block_idx, pos_in_block] = value[idx]
+
+def load_kvcache_cpu(k_cache: torch.Tensor, v_cache: torch.Tensor, block_table: torch.Tensor, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    CPU version of load_kvcache for a single sequence.
+    
+    Reconstructs the full key-value sequence from block-based storage.
+    
+    Args:
+        k_cache: Key cache storage of shape (num_blocks, block_size, num_heads, head_dim)
+        v_cache: Value cache storage of shape (num_blocks, block_size, num_heads, head_dim)
+        block_table: Block indices for this sequence, shape (num_blocks_used,)
+        seq_len: Total length of the sequence to reconstruct
+        
+    Returns:
+        Tuple of (k, v) tensors with shape (seq_len, num_heads, head_dim)
+    """
+    block_size = k_cache.shape[1]  # Get block_size from cache shape
+    num_kv_heads = k_cache.shape[2]
+    head_dim = k_cache.shape[3]
+    
+    assert len(block_table) * block_size >= seq_len, f"Not enough blocks: {len(block_table)} * {block_size} < {seq_len}"
+    
+    # Allocate output tensors
+    k = torch.empty(seq_len, num_kv_heads, head_dim, device='cpu', dtype=k_cache.dtype)
+    v = torch.empty(seq_len, num_kv_heads, head_dim, device='cpu', dtype=v_cache.dtype)
+    
+    # Copy data from blocks to output
+    output_pos = 0
+    for i in range(len(block_table)):
+        block_idx = block_table[i].item()
+        
+        # Determine how many tokens to copy from this block
+        tokens_in_this_block = min(block_size, seq_len - output_pos)
+        
+        # Copy the tokens from cache to output
+        k[output_pos:output_pos + tokens_in_this_block] = k_cache[block_idx, :tokens_in_this_block]
+        v[output_pos:output_pos + tokens_in_this_block] = v_cache[block_idx, :tokens_in_this_block]
+        
+        output_pos += tokens_in_this_block
+        
+        if output_pos >= seq_len:
+            break
+    
+    assert output_pos == seq_len, f"Loaded {output_pos} tokens but expected {seq_len}"
+    return k, v
 
 class Attention(nn.Module):
     """
@@ -108,9 +185,8 @@ class Attention(nn.Module):
         
         # Initialize empty KV caches - will be allocated by the engine
         self.k_cache = self.v_cache = torch.tensor([])
-        self.k_cache_cpu = {}
-        self.v_cache_cpu = {}
-        self.counter = count()
+        self.k_cache_cpu = torch.tensor([])
+        self.v_cache_cpu = torch.tensor([])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         """
@@ -139,93 +215,99 @@ class Attention(nn.Module):
         # Get execution context containing batch metadata and memory mappings
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
-        cache_infos = context.cache_infos
+        k_cache_cpu, v_cache_cpu = self.k_cache_cpu, self.v_cache_cpu
+        for i in range(len(context.cache_locations)):
+            if context.cache_locations[i] == BlockLocation.CPU:
+                print(f"seq {i} is on cpu")
         
         # Store new key-value pairs in cache if cache is allocated
         if k_cache.numel() and v_cache.numel():
-            cpu_idx = [i for (i, cache_location) in enumerate(cache_infos) if cache_location != -1]
-            if len(cpu_idx) == 0:
-                pass
-            elif context.is_prefill:
-                # store cache also in cpu
-                for idx in cpu_idx:
-                    start = context.cu_seqlens_k[idx]
-                    end = context.cu_seqlens_k[idx + 1]
-                    k_cache_cpu = k[start: end].to("cpu")
-                    v_cache_cpu = v[start: end].to("cpu")
-                    self.store_kv_cache_cpu(k_cache_cpu, v_cache_cpu, [cache_infos[idx]], prefill=True)
-                k_cache_cpu = k[cpu_idx]
-            
-            # decoding
-            else:
-                k_cpu = k[cpu_idx].to("cpu")
-                v_cpu = v[cpu_idx].to("cpu")
-                self.store_kv_cache_cpu(k_cpu, v_cpu, [i for i in cache_infos if i != -1], prefill=False)
+            # if this batch has cpu kv cache, store to cpu
+            if context.cpu_kv_cache:
+                # seperate cache for gpu and cpu
+                # k_gpu, v_gpu = k[context.slot_mapping != -1], v[context.slot_mapping != -1]
+                # k_cpu, v_cpu = k[context.slot_mapping_cpu != -1], v[context.slot_mapping_cpu != -1]
 
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
-            # if context.is_prefill:
-            #     print("prefill--------")
-        
+                
+                store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+                k_cpu, v_cpu = k.to("cpu"), v.to("cpu")
+                store_kvcache_cpu(k_cpu, v_cpu, k_cache_cpu, v_cache_cpu, context.slot_mapping_cpu)
+            else:
+                store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            # // store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
             # PREFILL: Processing new input tokens (first forward pass)
             if context.block_tables is not None:    # prefix cache case
                 # Reuse cached KV from previous requests (prefix caching optimization)
+                #! assume that no prefix cache for now
                 k, v = k_cache, v_cache
             
+            # concat two block tables
+            # block table is [batch, num_blocks]
+            # Merge per-sequence rows from GPU/CPU tables into one CUDA tensor
+            #! since no prefix cache for now, the block table should be None
+            if not context.cpu_kv_cache and context.block_tables is not None and context.block_tables_cpu is not None:
+                batch_size = len(context.cache_locations)
+                max_blocks = context.block_tables.shape[1]
+                block_tables_merged = torch.empty(batch_size, max_blocks, dtype=torch.int32, device='cuda')
+                
+                for i, loc in enumerate(context.cache_locations):
+                    if loc == BlockLocation.GPU:
+                        block_tables_merged[i] = context.block_tables[i]
+                    else:
+                        block_tables_merged[i] = context.block_tables_cpu[i].to('cuda', non_blocking=True)
+            else:
+                block_tables_merged = context.block_tables
+
             # Use variable-length FlashAttention for prefill
             # This handles sequences of different lengths efficiently
+            # since this is prefill, we can use block table merged and no need to load kv cache
             o = flash_attn_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
-            #print(f"cu seq len: {context.cu_seqlens_k.to('cpu')}")
-        else:    # DECODE: Generating next token
-            # Use KV-cache optimized FlashAttention for decode
-            # Only processes the new query token, reuses all cached KV
-
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                       softmax_scale=self.scale, causal=True, block_table=block_tables_merged)
+        # DECODE: Generating next token
+        else:    
+            if not context.cpu_kv_cache:
+                o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                         cache_seqlens=context.context_lens, block_table=context.block_tables, 
                                         softmax_scale=self.scale, causal=True)
-            #print(f"k_cache shape decoding: {k_cache.shape}, q shape: {q.shape}, o shape: {o.shape}")
-
-            # load cpu cache and calculate attention
-            o_cpu = torch.empty(0, 1, q.shape[-2], k.shape[-1]).to(o.device)
-            for i, cache_info in enumerate(cache_infos):
-                if cache_info == -1:
-                    continue
-                k_cpu, v_cpu = self.load_kv_cache_cpu(cache_info)
-                assert torch.equal(k_cpu[-1], k[i].to("cpu")), k_cpu.shape[0]
-                o_one = self.attention_cpu(q[i].to("cpu"), k_cpu, v_cpu, self.scale).to(o.device)
-                #print(f"virefication of attention for seq {i}: {torch.allclose(o[i], o_one, rtol=1e-2, atol=1e-2)}")
-                o_cpu = torch.cat([o_cpu, o_one.unsqueeze(0)], dim=0)
-                o[i] = o_one
-                
-
-            #print(f"cpu attention shape: {o_cpu.shape}")
-
-            # o shape: [seq_len, 1, num_q_heads, head_dim]
-        return o
-    
-    def store_kv_cache_cpu(self, k: Tensor, v: Tensor, slot_mapping: list[int], prefill: bool):
-        """
-        k_cache: [seq_len, num_heads, head_dim]
-        k: same
-        """
-        assert len(slot_mapping) > 0
-        for i, id in enumerate(slot_mapping):
-            if id not in self.k_cache_cpu:
-                assert prefill, id
-                self.k_cache_cpu[id] = k
-                self.v_cache_cpu[id] = v
+            # use gpu kv cache and cpu kv cache
             else:
-                assert not prefill
-                self.k_cache_cpu[id] = torch.cat([self.k_cache_cpu[id], k[i].unsqueeze(0)], dim=0)
-                self.v_cache_cpu[id] = torch.cat([self.v_cache_cpu[id], v[i].unsqueeze(0)], dim=0)
+                # seperate block table and context lens for gpu and cpu
+                block_tables_gpu = context.block_tables[context.cache_locations == BlockLocation.GPU]
+                block_tables_cpu = context.block_tables_cpu[context.cache_locations == BlockLocation.CPU]
+                context_lens_gpu = context.context_lens[context.cache_locations == BlockLocation.GPU]
+                context_lens_cpu = context.context_lens_cpu[context.cache_locations == BlockLocation.CPU]
 
-    def load_kv_cache_cpu(self, id):
-        if id not in self.k_cache_cpu:
-            return None
-        return self.k_cache_cpu[id], self.v_cache_cpu[id]
+                # o shape: [seq_len, 1, num_q_heads, head_dim]
+                print(context.cache_locations)
+                sleep(1)
+                o = torch.empty(len(context.cache_locations), 1, q.shape[-2], k.shape[-1], device='cpu')
+
+                # TODO: make gpu and cpu attention in parallel
+                # load kv cache and calculate attention for cpu sequences
+                for i, loc in enumerate(context.cache_locations):
+                    if loc == BlockLocation.GPU:
+                        continue
+                    # load kv cache for cpu sequence
+                    k_cpu, v_cpu = load_kvcache_cpu(k_cache_cpu, v_cache_cpu, block_tables_cpu[i], context_lens_cpu[i])
+                    # calculate attention for cpu sequence
+                    o_cpu = self.attention_cpu(q[i].to("cpu"), k_cpu, v_cpu, self.scale).to(o.device, non_blocking=True)
+                    # concatenate attention result for cpu sequences
+                    o[i] = o_cpu
+
+                # flash attention for gpu sequences
+                o_gpu = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                            cache_seqlens=context_lens_gpu, block_table=block_tables_gpu, 
+                                            softmax_scale=self.scale, causal=True)
+
+                # concat attention result for gpu sequences
+                for i, loc in enumerate(context.cache_locations):
+                    if loc == BlockLocation.GPU:
+                        o[i] = o_gpu[i]
+
+        return o
 
     def attention_cpu(self, q: torch.Tensor, k_cache, v_cache, softmax_scale) -> torch.Tensor:
         """

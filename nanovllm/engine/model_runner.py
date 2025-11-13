@@ -14,6 +14,7 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.engine.block_location import BlockLocation
 
 
 class ModelRunner:
@@ -29,6 +30,7 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size  # Size of each KV cache block
+        self.cpu_block_size = config.cpu_block_size # Size of each CPU KV cache block
         self.enforce_eager = config.enforce_eager    # Whether to force eager execution (no CUDA graphs)
         self.world_size = config.tensor_parallel_size  # Number of GPUs for tensor parallelism
         self.rank = rank  # Current GPU rank
@@ -152,40 +154,91 @@ class ModelRunner:
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        
+        # check cpu kv cache config and allocate cpu cache
+        if config.cpu_kv_cache:
+            assert config.cpu_block_size > 0 and config.num_cpu_blocks > 0
+            try:
+                self.cpu_kv_cache = torch.empty(2, 
+                                                hf_config.num_hidden_layers, 
+                                                config.num_cpu_blocks, 
+                                                self.cpu_block_size, 
+                                                num_kv_heads, 
+                                                head_dim,
+                                                pin_memory=True,
+                                                device="cpu")
+                size = self.cpu_kv_cache.element_size()
+                for i in self.cpu_kv_cache.shape:
+                    size *= i
+                print(f"successfully allocate cpu memory of {size / 1024**3:.2f} GB")
+            except RuntimeError as e:
+                print(f"Failed to allocate tensor: {e}")
+
+
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 # Assign K cache (index 0) and V cache (index 1) for this layer
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
+                
+                if config.cpu_kv_cache:
+                    assert hasattr(module, "k_cache_cpu") and hasattr(module, "v_cache_cpu")
+                    module.k_cache_cpu = self.cpu_kv_cache[0, layer_id]
+                    module.v_cache_cpu = self.cpu_kv_cache[1, layer_id]
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
-        """Prepare block tables for sequences by padding to equal length.
-        Block tables track which KV cache blocks are used for each sequence.
+        """Prepare per-device block tables padded to equal length.
+        Returns:
+            tuple[torch.Tensor | None, torch.Tensor | None]: (gpu_block_tables, cpu_block_tables)
+                - gpu_block_tables on CUDA
+                - cpu_block_tables on CPU
         """
-        max_len = max(len(seq.block_table) for seq in seqs)  # Find longest block table
-        # Pad all block tables to same length with -1 (indicating unused blocks)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        return block_tables
+        if not seqs:
+            return None, None
+        max_len = max(len(seq.block_table) for seq in seqs)
+        # GPU tables: keep rows for GPU sequences, fill -1 for CPU sequences
+        gpu_tables_list = []
+        # CPU tables: keep rows for CPU sequences, fill -1 for GPU sequences
+        cpu_tables_list = []
+        for seq in seqs:
+            padded = seq.block_table + [-1] * (max_len - len(seq.block_table))
+            if getattr(seq, "cache_location", BlockLocation.GPU) == BlockLocation.CPU:
+                # CPU row is real; GPU row is masked
+                cpu_tables_list.append(padded)
+                gpu_tables_list.append([-1] * max_len)
+            else:
+                # GPU row is real; CPU row is masked
+                gpu_tables_list.append(padded)
+                cpu_tables_list.append([-1] * max_len)
+        gpu_block_tables = torch.tensor(gpu_tables_list, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if max_len > 0 else None
+        cpu_block_tables = torch.tensor(cpu_tables_list, dtype=torch.int32, pin_memory=True, device="cpu") if max_len > 0 else None
+        return gpu_block_tables, cpu_block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
         """Prepare input data for prefill phase (processing new tokens in prompt).
         This phase computes attention for all tokens in new input sequences.
         """
-        input_ids = []      # Token IDs for new input
-        positions = []      # Position indices for each token
-        cu_seqlens_q = [0]  # Cumulative sequence lengths for queries (starts with 0)
-        cu_seqlens_k = [0]  # Cumulative sequence lengths for keys (starts with 0)
-        max_seqlen_q = 0    # Maximum query sequence length
-        max_seqlen_k = 0    # Maximum key sequence length
-        slot_mapping = []   # Mapping of tokens to KV cache slots
-        block_tables = None
+        input_ids = []       # Token IDs for new input
+        positions = []       # Position indices for each token
+        cu_seqlens_q = [0]   # Cumulative sequence lengths for queries (starts with 0)
+        cu_seqlens_k = [0]   # Cumulative sequence lengths for keys (starts with 0)
+        max_seqlen_q = 0     # Maximum query sequence length
+        max_seqlen_k = 0     # Maximum key sequence length
+        slot_mapping_gpu = []  # Mapping of tokens to GPU KV cache slots
+        slot_mapping_cpu = []  # Mapping of tokens to CPU KV cache slots
+        block_tables_gpu = None
+        block_tables_cpu = None
         cache_infos = []
-
+        cache_locations = []
+        cpu_kv_cache = False
         for seq in seqs:
             cache_infos.append(seq.cache_info)
+            cache_locations.append(getattr(seq, "cache_location", BlockLocation.GPU))
+            if getattr(seq, "cache_location", BlockLocation.GPU) == BlockLocation.CPU:
+                print(f"seq {seq.seq_id} is on cpu")
+                cpu_kv_cache = True
             seqlen = len(seq)  # Total sequence length
             # Extract tokens that aren't yet cached (new tokens to process)
             input_ids.extend(seq[seq.num_cached_tokens:])
@@ -203,58 +256,115 @@ class ModelRunner:
 
             if not seq.block_table:    # Skip during warmup (no block allocation)
                 continue
-
+            
             # Map new tokens to KV cache slots for storage
             for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size  # Start slot for this block
+                # Select block size by device for correct slot indexing
+                if getattr(seq, "cache_location", BlockLocation.GPU) == BlockLocation.CPU:
+                    blk_size = self.cpu_block_size
+                else:
+                    blk_size = self.block_size
+                start = seq.block_table[i] * blk_size  # Start slot for this block
                 if i != seq.num_blocks - 1:
-                    end = start + self.block_size  # Full block
+                    end = start + blk_size  # Full block
                 else:
                     end = start + seq.last_block_num_tokens  # Partial last block
-                slot_mapping.extend(list(range(start, end)))  # Add slot indices
+                slots = list(range(start, end))
+                # Fill per-device slot mappings
+                if getattr(seq, "cache_location", BlockLocation.GPU) == BlockLocation.CPU:
+                    # CPU sequence: GPU mapping masked, CPU mapping real
+                    slot_mapping_gpu.extend([-1] * len(slots))
+                    slot_mapping_cpu.extend(slots)
+                else:
+                    # GPU sequence: GPU mapping real, CPU mapping masked
+                    slot_mapping_gpu.extend(slots)
+                    slot_mapping_cpu.extend([-1] * len(slots))
 
         # Use block tables if we have cached context (prefix cache scenario)
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
-            block_tables = self.prepare_block_tables(seqs)
+            block_tables_gpu, block_tables_cpu = self.prepare_block_tables(seqs)
 
         # Convert to GPU tensors with async transfer for better performance
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-
+        slot_mapping_gpu = torch.tensor(slot_mapping_gpu, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        # CPU variant must live on CPU device explicitly (default device is CUDA)
+        slot_mapping_cpu = torch.tensor(slot_mapping_cpu, dtype=torch.int32, pin_memory=True, device="cpu")
         # Set context for efficient attention computation with FlashAttention
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, cache_infos)
+        print("in prepare_prefill, cpu_kv_cache", cpu_kv_cache)
+        set_context(
+            is_prefill=True,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            slot_mapping=slot_mapping_gpu,
+            slot_mapping_cpu=slot_mapping_cpu,
+            block_tables=block_tables_gpu,
+            block_tables_cpu=block_tables_cpu,
+            cache_locations=cache_locations,
+            cpu_kv_cache=cpu_kv_cache,
+            cache_infos=cache_infos,
+        )
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
         """Prepare input data for decode phase (generating next tokens).
         In this phase, we process one token per sequence and use cached context.
         """
-        input_ids = []      # Last token from each sequence
-        positions = []      # Position of last token in each sequence
-        slot_mapping = []   # KV cache slot for storing new token
-        context_lens = []   # Context length for each sequence
+        input_ids = []         # Last token from each sequence
+        positions = []         # Position of last token in each sequence
+        slot_mapping_gpu = []  # KV cache slot for storing new token on GPU
+        slot_mapping_cpu = []  # KV cache slot for storing new token on CPU
+        context_lens_gpu = []  # Context length for each sequence for GPU
+        context_lens_cpu = []  # Context length for each sequence for CPU
         cache_infos = []
-
+        cpu_kv_cache = False
         for seq in seqs:
             cache_infos.append(seq.cache_info)
             input_ids.append(seq.last_token)  # Most recently generated token
             positions.append(len(seq) - 1)    # Position = sequence length - 1
-            context_lens.append(len(seq))     # Full sequence length as context
             # Calculate slot for new token: last block + offset within block
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+            if getattr(seq, "cache_location", BlockLocation.GPU) == BlockLocation.CPU:
+                # CPU sequence: GPU mapping masked; CPU mapping uses cpu block size
+                slot_mapping_gpu.append(-1)
+                slot_mapping_cpu.append(seq.block_table[-1] * self.cpu_block_size + seq.last_block_num_tokens - 1)
+                context_lens_gpu.append(0)
+                context_lens_cpu.append(len(seq))
+                cpu_kv_cache = True
+                # print(f"seq {seq.seq_id} is on cpu")
+            else:
+                # GPU sequence: GPU mapping real; CPU mapping masked
+                slot_mapping_gpu.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+                slot_mapping_cpu.append(-1)
+                context_lens_gpu.append(len(seq))
+                context_lens_cpu.append(0)
 
         # Convert to GPU tensors with async transfer
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
+        slot_mapping_gpu = torch.tensor(slot_mapping_gpu, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        # CPU variants explicitly on CPU
+        slot_mapping_cpu = torch.tensor(slot_mapping_cpu, dtype=torch.int32, pin_memory=True, device="cpu")
+        context_lens_gpu = torch.tensor(context_lens_gpu, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens_cpu = torch.tensor(context_lens_cpu, dtype=torch.int32, pin_memory=True, device="cpu")
+        block_tables_gpu, block_tables_cpu = self.prepare_block_tables(seqs)
 
         # Set context for decode phase (single token per sequence)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, cache_infos=cache_infos)
+        set_context(
+            is_prefill=False,
+            slot_mapping=slot_mapping_gpu,
+            slot_mapping_cpu=slot_mapping_cpu,
+            context_lens=context_lens_gpu,
+            context_lens_cpu=context_lens_cpu,
+            block_tables=block_tables_gpu,
+            block_tables_cpu=block_tables_cpu,
+            cache_locations=[getattr(seq, "cache_location", BlockLocation.GPU) for seq in seqs],
+            cpu_kv_cache=cpu_kv_cache,
+            cache_infos=cache_infos,
+        )
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):

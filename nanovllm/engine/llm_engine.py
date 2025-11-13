@@ -75,6 +75,7 @@ class LLMEngine:
 
         # Register cleanup function to terminate workers on exit
         atexit.register(self.exit)
+        self.stats = None
 
     def exit(self):
         """
@@ -143,7 +144,18 @@ class LLMEngine:
         token_ids = self.model_runner.call("run", seqs, is_prefill)
 
         # Update sequence states and manage KV cache
-        self.scheduler.postprocess(seqs, token_ids)
+        finished = self.scheduler.postprocess(seqs, token_ids)
+
+        if self.stats is not None:
+            if is_prefill:
+                for seq in seqs:
+                    self.stats[seq.seq_id] = {"prefill": (perf_counter() - self.t, seq.num_tokens)}
+            else:
+                for seq, is_finished in zip(seqs, finished):
+                    if is_finished:
+                        start_time = self.stats[seq.seq_id]["prefill"][0] + self.t
+                        self.stats[seq.seq_id]["decode"] = (perf_counter() - self.t, seq.num_completion_tokens)
+            
 
         # Collect completed sequences for return
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
@@ -166,6 +178,7 @@ class LLMEngine:
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
+        stats: bool = False
     ) -> list[str]:
         """
         High-level API for batch text generation.
@@ -193,6 +206,8 @@ class LLMEngine:
         - New sequences can start while others are still generating
         - Maximizes GPU utilization and throughput
         """
+        if stats:
+            self.stats = {}
         # Initialize progress bar
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
@@ -211,15 +226,15 @@ class LLMEngine:
 
         # Main generation loop (continuous batching)
         while not self.is_finished():
-            t = perf_counter()
+            self.t = perf_counter()
             output, num_tokens = self.step()
 
             # Calculate and display throughput metrics
             if use_tqdm:
                 if num_tokens > 0:  # Prefill step
-                    prefill_throughput = num_tokens / (perf_counter() - t)
+                    prefill_throughput = num_tokens / (perf_counter() - self.t)
                 else:  # Decode step (num_tokens is negative)
-                    decode_throughput = -num_tokens / (perf_counter() - t)
+                    decode_throughput = -num_tokens / (perf_counter() - self.t)
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
@@ -239,5 +254,7 @@ class LLMEngine:
 
         if use_tqdm:
             pbar.close()
+        if stats:
+            return outputs, self.stats
         return outputs
  

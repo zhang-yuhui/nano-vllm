@@ -2,7 +2,7 @@ from collections import deque
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
-from nanovllm.engine.block_manager import BlockManager
+from nanovllm.engine.block_manager import BlockManager, BlockLocation
 
 
 class Scheduler:
@@ -25,12 +25,17 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs              # Maximum sequences per batch
         self.max_num_batched_tokens = config.max_num_batched_tokens  # Max tokens per batch
         self.eos = config.eos                                # End-of-sequence token ID
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        if config.cpu_kv_cache:
+            self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size, 
+                                              num_cpu_blocks=config.num_cpu_blocks, cpu_block_size=config.cpu_block_size)
+        else:
+            self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         
         # Two main queues for sequence management
         self.waiting: deque[Sequence] = deque()  # New sequences waiting for prefill
         self.running: deque[Sequence] = deque()  # Sequences currently generating tokens
-
+        self.temp = set()
+        
     def is_finished(self):
         """Check if all sequences have completed (no waiting or running sequences)."""
         return not self.waiting and not self.running
@@ -61,21 +66,44 @@ class Scheduler:
             
             # Check if we can fit this sequence in the current batch
             # Two constraints: token limit and memory availability
-            if (num_batched_tokens + len(seq) > self.max_num_batched_tokens or 
-                not self.block_manager.can_allocate(seq)):
+            if (num_batched_tokens + len(seq) > self.max_num_batched_tokens):
                 break
-            
-            # Allocate resources and move sequence to running state
-            num_seqs += 1
-            self.block_manager.allocate(seq)  # Allocate KV cache blocks
-            num_batched_tokens += len(seq) - seq.num_cached_tokens  # Count new tokens (excluding cached)
-            seq.status = SequenceStatus.RUNNING
-            if seq.seq_id == 1:
-                seq.cache_location = 'cpu'
-                seq.cache_info = 1
-            self.waiting.popleft()
-            self.running.append(seq)
-            scheduled_seqs.append(seq)
+
+            # allocate to GPU first
+            if not self.block_manager.can_allocate(seq, location=BlockLocation.GPU):
+                if self.block_manager.can_allocate(seq, location=BlockLocation.CPU):
+                    
+                    if seq.seq_id not in self.temp:
+                        print(f"Adding seq id {seq.seq_id} to cpu!")
+                        self.temp.add(seq.seq_id)
+                    break
+                    # num_seqs += 1
+                    # self.block_manager.allocate(seq, location=BlockLocation.CPU)
+                    # #! Currently the `num_bached_tokens` counts for both GPU and CPU
+                    # num_batched_tokens += len(seq) - seq.num_cached_tokens
+                    # self.waiting.popleft()
+                    # self.running.append(seq)
+                    # scheduled_seqs.append(seq)
+                else:
+                    break
+
+            else:                                     
+                # Allocate resources and move sequence to running state
+                num_seqs += 1
+                if seq.seq_id == 5:
+                    seq.cache_location = BlockLocation.CPU
+                    seq.cache_info = 1
+                    self.block_manager.allocate(seq, location=BlockLocation.CPU)
+                else:
+                    self.block_manager.allocate(seq)
+                num_batched_tokens += len(seq) - seq.num_cached_tokens  # Count new tokens (excluding cached)
+                seq.status = SequenceStatus.RUNNING
+                # if seq.seq_id == 1:
+                #     seq.cache_location = 'cpu'
+                #     seq.cache_info = 1
+                self.waiting.popleft()
+                self.running.append(seq)
+                scheduled_seqs.append(seq)
         
         # If we scheduled prefill sequences, return them
         if scheduled_seqs:

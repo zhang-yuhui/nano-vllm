@@ -2,7 +2,8 @@ from copy import copy
 from enum import Enum, auto
 from itertools import count
 from typing import Literal
-
+from nanovllm.config import Config
+from nanovllm.engine.block_location import BlockLocation
 from nanovllm.sampling_params import SamplingParams
 
 
@@ -13,10 +14,10 @@ class SequenceStatus(Enum):
 
 
 class Sequence:
-    block_size = 256
+    block_size = Config.kvcache_block_size
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams(), cache_location: Literal['cpu', 'gpu'] = 'gpu'):
+    def __init__(self, token_ids: list[int], sampling_params = SamplingParams(), cache_location: Literal['cpu', 'gpu'] | BlockLocation  = BlockLocation.GPU):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
@@ -28,8 +29,12 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
-        self.cache_location = cache_location
-        if cache_location == 'cpu' and self.seq_id != 0: # use gpu for warm up forward pass
+        if type(cache_location) == str:
+            self.cache_location = BlockLocation.GPU if cache_location == "gpu" else BlockLocation.CPU
+        else:
+            self.cache_location = cache_location
+        if cache_location == BlockLocation.CPU and self.seq_id != 0: # use gpu for warm up forward pass
+            self.block_size = Config.cpu_block_size # use cpu cache
             self.cache_info = self.seq_id
         else:
             self.cache_info = -1

@@ -4,18 +4,15 @@ from transformers import AutoTokenizer
 import torch
 
 def main():
-    a = torch.empty(15, 8, 128)
-    b = torch.empty(8, 128)
-    a = torch.cat([a, b.unsqueeze(0)], dim=0)
-    print(a.shape)
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
     tokenizer = AutoTokenizer.from_pretrained(path)
-    llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
+    cpu_kv_cache = True
+    llm = LLM(path, enforce_eager=True, tensor_parallel_size=1, cpu_kv_cache=cpu_kv_cache)
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=400)
     prompts = [
         "introduce yourself",
-        "list all prime numbers within 100",
+        "1231+3141=?",
         "hello"
     ]
     prompts = [
@@ -23,7 +20,7 @@ def main():
             [{"role": "user", "content": prompt}],
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=False
+            enable_thinking=False  
         )
         for prompt in prompts
     ]
