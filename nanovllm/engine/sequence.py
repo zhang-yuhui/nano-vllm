@@ -14,10 +14,11 @@ class SequenceStatus(Enum):
 
 
 class Sequence:
-    block_size = Config.kvcache_block_size
+    block_size_gpu = Config.kvcache_block_size
+    block_size_cpu = Config.cpu_block_size
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams(), cache_location: Literal['cpu', 'gpu'] | BlockLocation  = BlockLocation.GPU):
+    def __init__(self, token_ids: list[int], sampling_params = SamplingParams(), cache_location: BlockLocation = BlockLocation.GPU):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
@@ -29,15 +30,7 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
-        if type(cache_location) == str:
-            self.cache_location = BlockLocation.GPU if cache_location == "gpu" else BlockLocation.CPU
-        else:
-            self.cache_location = cache_location
-        if cache_location == BlockLocation.CPU and self.seq_id != 0: # use gpu for warm up forward pass
-            self.block_size = Config.cpu_block_size # use cpu cache
-            self.cache_info = self.seq_id
-        else:
-            self.cache_info = -1
+        self.cache_location = cache_location
 
     def __len__(self):
         return self.num_tokens
@@ -45,6 +38,9 @@ class Sequence:
     def __getitem__(self, key):
         return self.token_ids[key]
 
+    @property
+    def block_size(self):
+        return self.block_size_gpu if self.cache_location == BlockLocation.GPU else self.block_size_cpu
     @property
     def is_finished(self):
         return self.status == SequenceStatus.FINISHED

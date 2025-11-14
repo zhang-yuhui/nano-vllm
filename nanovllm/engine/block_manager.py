@@ -49,9 +49,6 @@ class BlockManager:
         # Default block size (for compatibility)
         self.block_size = self.gpu_block_size
 
-        if num_cpu_blocks != 0 and cpu_block_size is not None:
-            print(f"using cpu cache", num_cpu_blocks, cpu_block_size)
-
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
         h = xxhash.xxh64()
@@ -147,7 +144,7 @@ class BlockManager:
 
     def deallocate(self, seq: Sequence):
         """Deallocate sequence from its current location"""
-        if not hasattr(seq, 'block_location') or seq.cache_location is None:
+        if not hasattr(seq, 'cache_location') or seq.cache_location is None:
             # Backward compatibility - assume GPU
             seq.cache_location = BlockLocation.GPU
         
@@ -166,7 +163,7 @@ class BlockManager:
 
     def can_append(self, seq: Sequence) -> bool:
         """Check if we can append to sequence at its current location"""
-        if not hasattr(seq, 'block_location') or seq.cache_location is None:
+        if not hasattr(seq, 'cache_location') or seq.cache_location is None:
             seq.cache_location = BlockLocation.GPU
         
         location = seq.cache_location
@@ -178,7 +175,7 @@ class BlockManager:
 
     def may_append(self, seq: Sequence):
         """Append tokens to sequence at its current location"""
-        if not hasattr(seq, 'block_location') or seq.cache_location is None:
+        if not hasattr(seq, 'cache_location') or seq.cache_location is None:
             seq.cache_location = BlockLocation.GPU
         
         location = seq.cache_location

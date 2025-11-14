@@ -13,7 +13,7 @@ def main():
     prompts = [
         "introduce yourself",
         "1231+3141=?",
-        "hello"
+        "teach me python"
     ]
     prompts = [
         tokenizer.apply_chat_template(

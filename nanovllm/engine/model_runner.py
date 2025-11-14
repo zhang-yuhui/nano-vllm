@@ -157,6 +157,7 @@ class ModelRunner:
         
         # check cpu kv cache config and allocate cpu cache
         if config.cpu_kv_cache:
+            print(f"using cpu kv cache:\n\tblock size: {config.cpu_block_size}\n\tnum blocks: {config.num_cpu_blocks}")
             assert config.cpu_block_size > 0 and config.num_cpu_blocks > 0
             try:
                 self.cpu_kv_cache = torch.empty(2, 
@@ -230,14 +231,12 @@ class ModelRunner:
         slot_mapping_cpu = []  # Mapping of tokens to CPU KV cache slots
         block_tables_gpu = None
         block_tables_cpu = None
-        cache_infos = []
         cache_locations = []
         cpu_kv_cache = False
+        
         for seq in seqs:
-            cache_infos.append(seq.cache_info)
             cache_locations.append(getattr(seq, "cache_location", BlockLocation.GPU))
             if getattr(seq, "cache_location", BlockLocation.GPU) == BlockLocation.CPU:
-                print(f"seq {seq.seq_id} is on cpu")
                 cpu_kv_cache = True
             seqlen = len(seq)  # Total sequence length
             # Extract tokens that aren't yet cached (new tokens to process)
@@ -293,7 +292,6 @@ class ModelRunner:
         # CPU variant must live on CPU device explicitly (default device is CUDA)
         slot_mapping_cpu = torch.tensor(slot_mapping_cpu, dtype=torch.int32, pin_memory=True, device="cpu")
         # Set context for efficient attention computation with FlashAttention
-        print("in prepare_prefill, cpu_kv_cache", cpu_kv_cache)
         set_context(
             is_prefill=True,
             cu_seqlens_q=cu_seqlens_q,
@@ -306,7 +304,6 @@ class ModelRunner:
             block_tables_cpu=block_tables_cpu,
             cache_locations=cache_locations,
             cpu_kv_cache=cpu_kv_cache,
-            cache_infos=cache_infos,
         )
         return input_ids, positions
 
@@ -320,10 +317,9 @@ class ModelRunner:
         slot_mapping_cpu = []  # KV cache slot for storing new token on CPU
         context_lens_gpu = []  # Context length for each sequence for GPU
         context_lens_cpu = []  # Context length for each sequence for CPU
-        cache_infos = []
         cpu_kv_cache = False
+
         for seq in seqs:
-            cache_infos.append(seq.cache_info)
             input_ids.append(seq.last_token)  # Most recently generated token
             positions.append(len(seq) - 1)    # Position = sequence length - 1
             # Calculate slot for new token: last block + offset within block
@@ -334,7 +330,6 @@ class ModelRunner:
                 context_lens_gpu.append(0)
                 context_lens_cpu.append(len(seq))
                 cpu_kv_cache = True
-                # print(f"seq {seq.seq_id} is on cpu")
             else:
                 # GPU sequence: GPU mapping real; CPU mapping masked
                 slot_mapping_gpu.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
@@ -363,7 +358,6 @@ class ModelRunner:
             block_tables_cpu=block_tables_cpu,
             cache_locations=[getattr(seq, "cache_location", BlockLocation.GPU) for seq in seqs],
             cpu_kv_cache=cpu_kv_cache,
-            cache_infos=cache_infos,
         )
         return input_ids, positions
 

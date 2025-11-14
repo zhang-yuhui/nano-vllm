@@ -56,10 +56,6 @@ class Scheduler:
         scheduled_seqs = []
         num_seqs = 0
         num_batched_tokens = 0
-        """
-        [1, 2, 3]
-        [3]
-        """
         # PHASE 1: PREFILL - Process new sequences from waiting queue
         while self.waiting and num_seqs < self.max_num_seqs:
             seq = self.waiting[0]
@@ -90,7 +86,7 @@ class Scheduler:
             else:                                     
                 # Allocate resources and move sequence to running state
                 num_seqs += 1
-                if seq.seq_id == 5:
+                if seq.seq_id == 1:
                     seq.cache_location = BlockLocation.CPU
                     seq.cache_info = 1
                     self.block_manager.allocate(seq, location=BlockLocation.CPU)

@@ -18,7 +18,7 @@ class Config:
     num_kvcache_blocks: int = -1
     cpu_kv_cache: bool = True
     cpu_block_size: int = 4096
-    num_cpu_blocks: int = 2
+    num_cpu_blocks: int = 16
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -26,5 +26,4 @@ class Config:
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
-        print(f"using context length: {self.hf_config.max_position_embeddings}")
         assert self.max_num_batched_tokens >= self.max_model_len

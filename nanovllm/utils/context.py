@@ -20,7 +20,6 @@ class Context:
     block_tables_cpu: torch.Tensor | None = None
     cache_locations: list[BlockLocation] | None = None
     cpu_kv_cache: bool = False
-    cache_infos: list[int] | None = None
 
 
 _CONTEXT = Context()
@@ -33,15 +32,14 @@ def set_context(is_prefill,
     slot_mapping=None, slot_mapping_cpu=None, 
     context_lens=None, context_lens_cpu=None, 
     block_tables=None, block_tables_cpu=None, 
-    cache_locations=None, cpu_kv_cache=False,
-    cache_infos=None):
+    cache_locations=None, cpu_kv_cache=False):
     
     global _CONTEXT
     _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, 
                         slot_mapping, slot_mapping_cpu, 
                         context_lens, context_lens_cpu, 
                         block_tables, block_tables_cpu, 
-                        cache_locations, cpu_kv_cache, cache_infos)
+                        cache_locations, cpu_kv_cache, )
 
 def reset_context():
     global _CONTEXT
