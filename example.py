@@ -29,7 +29,7 @@ def main():
     for prompt, output in zip(prompts, outputs):
         print("\n")
         print(f"Prompt: {prompt!r}")
-        print(f"Completion: {output['text']!r}")
+        print(f"Completion: {output['text']}")
 
 
 if __name__ == "__main__":

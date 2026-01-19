@@ -86,7 +86,7 @@ class Scheduler:
             else:                                     
                 # Allocate resources and move sequence to running state
                 num_seqs += 1
-                if seq.seq_id == 1:
+                if seq.seq_id == 6:
                     seq.cache_location = BlockLocation.CPU
                     seq.cache_info = 1
                     self.block_manager.allocate(seq, location=BlockLocation.CPU)
