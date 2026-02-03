@@ -4,7 +4,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 from time import perf_counter, sleep
-
+from itertools import count
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.engine.block_location import BlockLocation
 from nanovllm.utils.context import get_context
@@ -177,6 +177,16 @@ class Attention(nn.Module):
         num_kv_heads,
     ):
         super().__init__()
+        self.profiler = torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ],
+                        # schedule=None means it will record EVERYTHING until stopped
+                        record_shapes=True,
+                        profile_memory=True,
+                        with_stack=True,
+                    )
         self.num_heads = num_heads      # Number of attention heads
         self.head_dim = head_dim        # Dimension of each attention head
         self.scale = scale             # Scaling factor (usually 1/sqrt(head_dim))
@@ -192,7 +202,20 @@ class Attention(nn.Module):
         self.cpu_store_stream = torch.cuda.Stream()
         self.cpu_attn_stream = torch.cuda.Stream()
         self.gpu_attn_stream = torch.cuda.Stream()
+        self.output_stream = torch.cuda.Stream()
+        self.counter = count()
+        self.profile_step = 30
+        self.profile_trace_path = "forward_30.json"
 
+    def _export_trace(self, path: str) -> None:
+        # export_chrome_trace needs profiler results, which are only available after stop()
+        self.profiler.stop()
+        self.profiler.export_chrome_trace(path)
+
+    def set_profile_step(self, step: int | None, trace_path: str | None = None) -> None:
+        # Set to an int to profile exactly one forward call, or None to disable.
+        self.profile_step = step
+        self.profile_trace_path = trace_path
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         """
         Forward pass of the attention layer.
@@ -218,6 +241,10 @@ class Attention(nn.Module):
             o: Output tensor with attention results
         """
         # Get execution context containing batch metadata and memory mappings
+        step = next(self.counter)
+        profile_this_call = self.profile_step is not None and step == self.profile_step
+        if profile_this_call:
+            self.profiler.start()
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         k_cache_cpu, v_cache_cpu = self.k_cache_cpu, self.v_cache_cpu
@@ -231,7 +258,6 @@ class Attention(nn.Module):
             
                 k_cpu = k.to("cpu", non_blocking=True)  # Blocking transfer
                 v_cpu = v.to("cpu", non_blocking=True)  # Blocking transfer
-                torch.cuda.synchronize()
                 store_kvcache_cpu(k_cpu, v_cpu, k_cache_cpu, v_cache_cpu, context.slot_mapping_cpu)
             else:
                 store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
@@ -280,9 +306,21 @@ class Attention(nn.Module):
                 cpu_indices = [i for i, loc in enumerate(context.cache_locations) if loc == BlockLocation.CPU]
                 gpu_indices = [i for i, loc in enumerate(context.cache_locations) if loc == BlockLocation.GPU]
                 
-                # Allocate output tensor
+                # if self.profiler is None:
+                #     self.profiler = torch.profiler.profile(
+                #         activities=[
+                #             torch.profiler.ProfilerActivity.CPU,
+                #             torch.profiler.ProfilerActivity.CUDA,
+                #         ],
+                #         # schedule=None means it will record EVERYTHING until stopped
+                #         record_shapes=True,
+                #         profile_memory=True,
+                #         with_stack=True,
+                #     )
+                #     self.profiler.start()
+                    # Allocate output tensor
                 o = torch.empty(len(context.cache_locations), 1, q.shape[-2], k.shape[-1], device=q.device, dtype=q.dtype)
-                
+            
                 # Process GPU sequences (if any) - synchronously
                 if gpu_indices:
                     # Extract only GPU sequences from tensors
@@ -295,11 +333,13 @@ class Attention(nn.Module):
                                                 block_table=block_tables_gpu_filtered, 
                                                 softmax_scale=self.scale, causal=True)
                     
-                    # Copy GPU results to output tensor
+                if gpu_indices:
+                        # Copy GPU results to output tensor
                     for idx, batch_i in enumerate(gpu_indices):
                         o[batch_i] = o_gpu[idx]
-                
-                # Process CPU sequences (if any) - synchronously
+            
+            
+                    # Process CPU sequences (if any) - synchronouslys
                 if cpu_indices:
                     # Extract only CPU sequences and transfer to CPU (blocking)
                     q_cpu_subset = q[cpu_indices].to("cpu")
@@ -308,14 +348,23 @@ class Attention(nn.Module):
                     for idx, batch_i in enumerate(cpu_indices):
                         # Load kv cache for this CPU sequence
                         k_cpu, v_cpu = load_kvcache_cpu(k_cache_cpu, v_cache_cpu, 
-                                                         context.block_tables_cpu[batch_i], 
-                                                         context.context_lens_cpu[batch_i])
+                                                        context.block_tables_cpu[batch_i], 
+                                                        context.context_lens_cpu[batch_i])
                         # Calculate attention for CPU sequence
                         o_cpu = self.attention_cpu(q_cpu_subset[idx], k_cpu, v_cpu, self.scale)
                         # Transfer result back to GPU (blocking)
                         o[batch_i] = o_cpu.to(o.device)
-            #print(o.dtype)
+                if profile_this_call:
+                    self.profiler.step()
+                #print(o.dtype)
 
+        if profile_this_call:
+            #print(f"gpu_indices: {gpu_indices}")
+            #print(f"cpu_indices: {cpu_indices}")
+            trace_path =  f"forward_{11}.json"
+            self._export_trace(trace_path)
+            # Disable after one capture unless explicitly re-armed.
+            self.profile_step = None
         return o
 
     def attention_cpu(self, q: torch.Tensor, k_cache, v_cache, softmax_scale) -> torch.Tensor:
