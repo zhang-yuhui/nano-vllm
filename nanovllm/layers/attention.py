@@ -205,7 +205,7 @@ class Attention(nn.Module):
         self.output_stream = torch.cuda.Stream()
         self.counter = count()
         self.profile_step = 30
-        self.profile_trace_path = "forward_30.json"
+        self.profile_trace_path = f"forward{self.profile_step}.json"
 
     def _export_trace(self, path: str) -> None:
         # export_chrome_trace needs profiler results, which are only available after stop()
@@ -256,8 +256,8 @@ class Attention(nn.Module):
                 
                 store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
             
-                k_cpu = k.to("cpu", non_blocking=True)  # Blocking transfer
-                v_cpu = v.to("cpu", non_blocking=True)  # Blocking transfer
+                k_cpu = k.to("cpu")  # Blocking transfer
+                v_cpu = v.to("cpu")  # Blocking transfer
                 store_kvcache_cpu(k_cpu, v_cpu, k_cache_cpu, v_cache_cpu, context.slot_mapping_cpu)
             else:
                 store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
@@ -267,6 +267,7 @@ class Attention(nn.Module):
             if context.block_tables is not None:    # prefix cache case
                 # Reuse cached KV from previous requests (prefix caching optimization)
                 #! assume that no prefix cache for now
+                print("using prefix cache!")
                 k, v = k_cache, v_cache
             
             # concat two block tables
@@ -283,7 +284,7 @@ class Attention(nn.Module):
                     if loc == BlockLocation.GPU:
                         block_tables_merged[i] = context.block_tables[i]
                     else:
-                        block_tables_merged[i] = context.block_tables_cpu[i].to('cuda', non_blocking=True)
+                        block_tables_merged[i] = context.block_tables_cpu[i].to('cuda')
             else:
                 block_tables_merged = context.block_tables
 
@@ -305,38 +306,25 @@ class Attention(nn.Module):
                 # Separate CPU and GPU sequence indices
                 cpu_indices = [i for i, loc in enumerate(context.cache_locations) if loc == BlockLocation.CPU]
                 gpu_indices = [i for i, loc in enumerate(context.cache_locations) if loc == BlockLocation.GPU]
-                
-                # if self.profiler is None:
-                #     self.profiler = torch.profiler.profile(
-                #         activities=[
-                #             torch.profiler.ProfilerActivity.CPU,
-                #             torch.profiler.ProfilerActivity.CUDA,
-                #         ],
-                #         # schedule=None means it will record EVERYTHING until stopped
-                #         record_shapes=True,
-                #         profile_memory=True,
-                #         with_stack=True,
-                #     )
-                #     self.profiler.start()
-                    # Allocate output tensor
                 o = torch.empty(len(context.cache_locations), 1, q.shape[-2], k.shape[-1], device=q.device, dtype=q.dtype)
             
+
                 # Process GPU sequences (if any) - synchronously
-                if gpu_indices:
-                    # Extract only GPU sequences from tensors
-                    q_gpu = q[gpu_indices]
-                    context_lens_gpu_filtered = context.context_lens[gpu_indices]
-                    block_tables_gpu_filtered = context.block_tables[gpu_indices]
-                    
-                    o_gpu = flash_attn_with_kvcache(q_gpu.unsqueeze(1), k_cache, v_cache,
-                                                cache_seqlens=context_lens_gpu_filtered, 
-                                                block_table=block_tables_gpu_filtered, 
-                                                softmax_scale=self.scale, causal=True)
-                    
-                if gpu_indices:
+                with torch.cuda.stream(self.gpu_attn_stream):
+                    if gpu_indices:
+                        # Extract only GPU sequences from tensors
+                        q_gpu = q[gpu_indices]
+                        context_lens_gpu_filtered = context.context_lens[gpu_indices]
+                        block_tables_gpu_filtered = context.block_tables[gpu_indices]
+                        
+                        o_gpu = flash_attn_with_kvcache(q_gpu.unsqueeze(1), k_cache, v_cache,
+                                                    cache_seqlens=context_lens_gpu_filtered, 
+                                                    block_table=block_tables_gpu_filtered, 
+                                                    softmax_scale=self.scale, causal=True)
+                        
                         # Copy GPU results to output tensor
-                    for idx, batch_i in enumerate(gpu_indices):
-                        o[batch_i] = o_gpu[idx]
+                        for idx, batch_i in enumerate(gpu_indices):
+                            o[batch_i] = o_gpu[idx]
             
             
                     # Process CPU sequences (if any) - synchronouslys
@@ -354,6 +342,10 @@ class Attention(nn.Module):
                         o_cpu = self.attention_cpu(q_cpu_subset[idx], k_cpu, v_cpu, self.scale)
                         # Transfer result back to GPU (blocking)
                         o[batch_i] = o_cpu.to(o.device)
+                        
+
+                torch.cuda.synchronize()
+
                 if profile_this_call:
                     self.profiler.step()
                 #print(o.dtype)
@@ -361,8 +353,9 @@ class Attention(nn.Module):
         if profile_this_call:
             #print(f"gpu_indices: {gpu_indices}")
             #print(f"cpu_indices: {cpu_indices}")
-            trace_path =  f"forward_{11}.json"
+            trace_path =  self.profile_trace_path
             self._export_trace(trace_path)
+            #print(f"current cache locations: {context.cache_locations}")
             # Disable after one capture unless explicitly re-armed.
             self.profile_step = None
         return o

@@ -35,6 +35,7 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()  # New sequences waiting for prefill
         self.running: deque[Sequence] = deque()  # Sequences currently generating tokens
         self.temp = set()
+        self.seqs = config.num_sequences.copy()
         
     def is_finished(self):
         """Check if all sequences have completed (no waiting or running sequences)."""
@@ -86,11 +87,14 @@ class Scheduler:
             else:                                     
                 # Allocate resources and move sequence to running state
                 num_seqs += 1
-                if seq.seq_id == 6:
+                if seq.seq_id - 4 < self.seqs[0]: # have seqs[0] sequences in gpu
+                # if seq.seq_id == 5: # have seqs[0] sequences in gpu
+                    print(f"Adding seq id {seq.seq_id} to cpu!")
                     seq.cache_location = BlockLocation.CPU
                     seq.cache_info = 1
                     self.block_manager.allocate(seq, location=BlockLocation.CPU)
                 else:
+                    print(f"Adding seq id {seq.seq_id} to gpu!")
                     self.block_manager.allocate(seq)
                 num_batched_tokens += len(seq) - seq.num_cached_tokens  # Count new tokens (excluding cached)
                 seq.status = SequenceStatus.RUNNING
@@ -169,6 +173,7 @@ class Scheduler:
                 
                 # Mark sequence as finished and clean up resources
                 seq.status = SequenceStatus.FINISHED
+                print(f"seq id {seq.seq_id} on {seq.cache_location} finished!")
                 self.block_manager.deallocate(seq)  # Free KV cache blocks
                 self.running.remove(seq)            # Remove from running queue
 

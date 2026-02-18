@@ -115,7 +115,11 @@ class BlockManager:
         used_ids = self._get_used_ids(location)
         
         h = -1
-        cache_miss = False
+        # Disable prefix caching when CPU KV cache is active.
+        # Mixed CPU/GPU paged attention can't be handled in a single
+        # flash_attn_varlen_func call because CPU sequences have no
+        # valid GPU block table entries.
+        cache_miss = len(self.cpu_blocks) > 0
         
         for i in range(seq.num_blocks):
             token_ids = seq.block(i)

@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from transformers import AutoConfig
 
 
@@ -19,6 +19,7 @@ class Config:
     cpu_kv_cache: bool = True
     cpu_block_size: int = 4096
     num_cpu_blocks: int = 16
+    num_sequences: list[int] = field(default_factory=lambda: [2,10])
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

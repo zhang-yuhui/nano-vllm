@@ -72,6 +72,7 @@ class LLMEngine:
 
         # Initialize scheduler for continuous batching
         self.scheduler = Scheduler(config)
+        self.config = config
 
         # Register cleanup function to terminate workers on exit
         atexit.register(self.exit)
