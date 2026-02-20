@@ -5,7 +5,7 @@ import torch
 import torch.profiler
 from random import randint
 def main():
-    path = os.path.expanduser("~/huggingface/Qwen3-8B/")
+    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
     tokenizer = AutoTokenizer.from_pretrained(path)
     cpu_kv_cache = True
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1, cpu_kv_cache=cpu_kv_cache)
