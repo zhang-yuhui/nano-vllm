@@ -51,6 +51,10 @@ class Qwen3Attention(nn.Module):
             hidden_size,
             bias=False,
         )
+        # Our rotary embedding implementation only supports the default mode.
+        # Hugging Face configs may provide `rope_scaling` as a dict, which is
+        # unhashable and breaks `get_rope`'s lru_cache key generation.
+        rope_scaling = None
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,

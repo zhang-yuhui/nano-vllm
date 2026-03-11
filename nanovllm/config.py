@@ -9,7 +9,7 @@ class Config:
     max_num_batched_tokens: int = 16384 * 2
     max_num_seqs: int = 512
     max_model_len: int = 4096 * 2 # change so that it can have longer context len
-    gpu_memory_utilization: float = 0.6
+    gpu_memory_utilization: float = 0.8
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: AutoConfig | None = None
@@ -17,9 +17,9 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     cpu_kv_cache: bool = True
-    cpu_block_size: int = 4096
+    cpu_block_size: int = 1024 * 8 *100 # 16KB
     num_cpu_blocks: int = 16
-    num_sequences: list[int] = field(default_factory=lambda: [0,1])
+    num_sequences: list[int] = field(default_factory=lambda: [3,0])
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

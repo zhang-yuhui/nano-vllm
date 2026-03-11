@@ -1,22 +1,28 @@
 import os
+from dotenv import load_dotenv
+# has to before import torch
+load_dotenv()
+os.environ["CUDA_VISIBLE_DEVICES"] = os.getenv("CUDA_VISIBLE_DEVICES")
+#print(f"Using GPU {os.environ["CUDA_VISIBLE_DEVICES"]}")
 from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 import torch
 import torch.profiler
 from random import randint
 def main():
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    
+    path = os.path.expanduser("/data/ray/huggingface/Qwen3-8B/")
     tokenizer = AutoTokenizer.from_pretrained(path)
     cpu_kv_cache = True
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1, cpu_kv_cache=cpu_kv_cache)
 
-    max_tokens = 200
+    max_tokens = 300
     sampling_params = SamplingParams(temperature=0.6, max_tokens=max_tokens)
     seqs = llm.config.num_sequences
     long_prompt = ""
     with open("long_prompt.txt", "r") as f:
         long_prompt = f.read()
-    prompts = ["Calculate the result of 2923+2132 by step by step:" for _ in range(seqs[1])]
+    prompts = ["Calculate the result of 2923+2132 by step by step:" for _ in range(seqs[0])]
     # for i in range(seqs[1]):
     #     prompts.append(long_prompt)
 
@@ -30,15 +36,28 @@ def main():
         for prompt in prompts
     ]
 
-    # for i in range(seqs[1]):
-    #     prompts.append([randint(0, 10000) for _ in range(4096)])
-    # print(f"short prompt length: {len(prompts[0])}")
-    # print(f"long prompt length: {len(prompts[-1])}")
+    for i in range(seqs[1]):
+        prompts.append([randint(0, 10000) for _ in range(4096)])
+    print(f"short prompt length: {len(prompts[0])}")
+    print(f"long prompt length: {len(prompts[-1])}")
     
+    profiler = torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ],
+                        # schedule=None means it will record EVERYTHING until stopped
+                        record_shapes=True,
+                        profile_memory=True,
+                        with_stack=True,
+                    )
+
+    # profiler.start()
     outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
+    # profiler.stop()
+    # profiler.export_chrome_trace(f"forward{max_tokens}.json")
 
     for prompt, output in zip(prompts, outputs):
-        # pass
         #print(f"Prompt: {prompt!r}")
         print(f"Completion: {output['text']}")
 

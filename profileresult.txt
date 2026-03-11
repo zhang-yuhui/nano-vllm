@@ -1,0 +1,121 @@
+naive cpu:
+
+ray@lambda7-scip:/data/ray/nano-vllm$ uv run profile_attention.py 
+============================================================
+nano-vllm Attention decode profiler
+============================================================
+  KV cache size               : 9216 MB
+  Sequence location           : CPU
+  Block size                  : 8192 tokens
+  Num KV cache blocks         : 288
+  Max cache capacity          : 2359296 tokens
+  Sequence length (cached)    : 8000 tokens
+  Total tokens after decode   : 8001 tokens
+
+  Actual GPU KV cache         : 1.00 MB  (shape [1, 256, 8, 128], K+V)
+  Actual CPU KV cache         : 9216.00 MB  (shape [288, 8192, 8, 128], K+V)
+  Total KV cache allocated    : 9217.00 MB
+  KV cache in use (SEQ_LEN)   : 31.2500 MB  (8000 tokens × 8 heads × 128 dim × K+V × fp16)
+
+Pre-populating KV cache with random data...
+0it [00:00, ?it/s]
+Done.
+
+Warming up (5 iterations)...
+Done.
+
+Profiling (20 iterations)...
+100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 20/20 [00:02<00:00,  7.25it/s]
+
+============================================================
+Results
+============================================================
+  Iterations                  : 20
+  Total elapsed               : 2761.19 ms
+  Average latency             : 138.059 ms
+  Throughput                  : 7.2 decode steps/s
+============================================================
+
+
+
+
+
+GPU:
+
+
+
+ray@lambda7-scip:/data/ray/nano-vllm$ uv run profile_attention.py 
+============================================================
+nano-vllm Attention decode profiler
+============================================================
+  KV cache size               : 9216 MB
+  Sequence location           : GPU
+  Block size                  : 256 tokens
+  Num KV cache blocks         : 9216
+  Max cache capacity          : 2359296 tokens
+  Sequence length (cached)    : 8000 tokens
+  Total tokens after decode   : 8001 tokens
+
+  Actual GPU KV cache         : 9216.00 MB  (shape [9216, 256, 8, 128], K+V)
+  Actual CPU KV cache         : 0.00 MB  (shape [0], K+V)
+  Total KV cache allocated    : 9216.00 MB
+  KV cache in use (SEQ_LEN)   : 31.2500 MB  (8000 tokens × 8 heads × 128 dim × K+V × fp16)
+
+Pre-populating KV cache with random data...
+Done.
+
+Warming up (5 iterations)...
+Done.
+
+Profiling (20 iterations)...
+100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 20/20 [00:00<00:00, 11131.38it/s]
+
+============================================================
+Results
+============================================================
+  Iterations                  : 20
+  Total elapsed               : 3.17 ms
+  Average latency             : 0.159 ms
+  Throughput                  : 6302.3 decode steps/s
+============================================================
+
+
+
+impoved 1 cpu:
+
+
+ray@lambda7-scip:/data/ray/nano-vllm$ uv run profile_attention.py 
+============================================================
+nano-vllm Attention decode profiler
+============================================================
+  KV cache size               : 9216 MB
+  Sequence location           : CPU
+  Block size                  : 8192 tokens
+  Num KV cache blocks         : 288
+  Max cache capacity          : 2359296 tokens
+  Sequence length (cached)    : 8000 tokens
+  Total tokens after decode   : 8001 tokens
+
+  Actual GPU KV cache         : 1.00 MB  (shape [1, 256, 8, 128], K+V)
+  Actual CPU KV cache         : 9216.00 MB  (shape [288, 8192, 8, 128], K+V)
+  Total KV cache allocated    : 9217.00 MB
+  KV cache in use (SEQ_LEN)   : 31.2500 MB  (8000 tokens × 8 heads × 128 dim × K+V × fp16)
+
+Pre-populating KV cache with random data...
+0it [00:00, ?it/s]
+Done.
+
+Warming up (5 iterations)...
+Done.
+
+Profiling (20 iterations)...
+100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 20/20 [00:00<00:00, 24.25it/s]
+
+============================================================
+Results
+============================================================
+  Iterations                  : 20
+  Total elapsed               : 826.46 ms ~ 950ms
+  Average latency             : 41.323 ms
+  Throughput                  : 24.2 decode steps/s
+============================================================

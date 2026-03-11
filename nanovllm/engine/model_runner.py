@@ -168,6 +168,7 @@ class ModelRunner:
                                                 head_dim,
                                                 pin_memory=True,
                                                 device="cpu")
+                print(f"CPU KV Cache shape: {self.cpu_kv_cache.shape}")
                 size = self.cpu_kv_cache.element_size()
                 for i in self.cpu_kv_cache.shape:
                     size *= i
