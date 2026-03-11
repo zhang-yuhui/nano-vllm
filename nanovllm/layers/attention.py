@@ -8,7 +8,20 @@ from itertools import count
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.engine.block_location import BlockLocation
 from nanovllm.utils.context import get_context
+from pathlib import Path
 
+
+def load_decode_extension() -> None:
+    root = Path(__file__).resolve().parent.parent.parent
+    build_dir = root / "build" / "decode_ext"
+    matches = sorted(build_dir.glob("decode_ext*.so"))
+    print(build_dir)
+    if not matches:
+        raise FileNotFoundError(
+            f"Missing decode extension under {build_dir}. "
+            f"Build it first with: python {root / 'build_decode.py'}"
+        )
+    torch.ops.load_library(str(matches[0]))
 
 @triton.jit
 def store_kvcache_kernel(
@@ -132,30 +145,18 @@ def load_kvcache_cpu(k_cache: torch.Tensor, v_cache: torch.Tensor, block_table: 
     head_dim = k_cache.shape[3]
     
     assert len(block_table) * block_size >= seq_len, f"Not enough blocks: {len(block_table)} * {block_size} < {seq_len}"
-    
-    # Allocate output tensors
-    k = torch.empty(seq_len, num_kv_heads, head_dim, device='cpu', dtype=k_cache.dtype)
-    v = torch.empty(seq_len, num_kv_heads, head_dim, device='cpu', dtype=v_cache.dtype)
+    assert len(block_table) == 1 or block_table[1] == -1, f"block table: {block_table} is not a single block table" # only one block table for now
+    # # Allocate output tensors 
+    # no need to allocate output tensors becuase we can directly return the k and v from the cache
+    # k = torch.empty(seq_len, num_kv_heads, head_dim, device='cpu', dtype=k_cache.dtype)
+    # v = torch.empty(seq_len, num_kv_heads, head_dim, device='cpu', dtype=v_cache.dtype)
     
     # Copy data from blocks to output
     output_pos = 0
-    for i in range(len(block_table)):
-        block_idx = block_table[i].item()
-        
-        # Determine how many tokens to copy from this block
-        tokens_in_this_block = min(block_size, seq_len - output_pos)
-        
-        # Copy the tokens from cache to output
-        k[output_pos:output_pos + tokens_in_this_block] = k_cache[block_idx, :tokens_in_this_block]
-        v[output_pos:output_pos + tokens_in_this_block] = v_cache[block_idx, :tokens_in_this_block]
-        
-        output_pos += tokens_in_this_block
-        
-        if output_pos >= seq_len:
-            break
-    
-    assert output_pos == seq_len, f"Loaded {output_pos} tokens but expected {seq_len}"
-    return k, v
+    tokens_in_this_block = min(block_size, seq_len)
+    block_idx = block_table[0].item()
+
+    return k_cache[block_idx, :tokens_in_this_block], v_cache[block_idx, :tokens_in_this_block]
 
 class Attention(nn.Module):
     """
@@ -204,8 +205,10 @@ class Attention(nn.Module):
         self.gpu_attn_stream = torch.cuda.Stream()
         self.output_stream = torch.cuda.Stream()
         self.counter = count()
-        self.profile_step = 30
+        self.profile_step = None
         self.profile_trace_path = f"forward{self.profile_step}.json"
+        load_decode_extension()
+
 
     def _export_trace(self, path: str) -> None:
         # export_chrome_trace needs profiler results, which are only available after stop()
@@ -309,22 +312,20 @@ class Attention(nn.Module):
                 o = torch.empty(len(context.cache_locations), 1, q.shape[-2], k.shape[-1], device=q.device, dtype=q.dtype)
             
 
-                # Process GPU sequences (if any) - synchronously
-                with torch.cuda.stream(self.gpu_attn_stream):
-                    if gpu_indices:
-                        # Extract only GPU sequences from tensors
-                        q_gpu = q[gpu_indices]
-                        context_lens_gpu_filtered = context.context_lens[gpu_indices]
-                        block_tables_gpu_filtered = context.block_tables[gpu_indices]
-                        
-                        o_gpu = flash_attn_with_kvcache(q_gpu.unsqueeze(1), k_cache, v_cache,
-                                                    cache_seqlens=context_lens_gpu_filtered, 
-                                                    block_table=block_tables_gpu_filtered, 
-                                                    softmax_scale=self.scale, causal=True)
-                        
-                        # Copy GPU results to output tensor
-                        for idx, batch_i in enumerate(gpu_indices):
-                            o[batch_i] = o_gpu[idx]
+                if gpu_indices:
+                    # Extract only GPU sequences from tensors
+                    q_gpu = q[gpu_indices]
+                    context_lens_gpu_filtered = context.context_lens[gpu_indices]
+                    block_tables_gpu_filtered = context.block_tables[gpu_indices]
+                    
+                    o_gpu = flash_attn_with_kvcache(q_gpu.unsqueeze(1), k_cache, v_cache,
+                                                cache_seqlens=context_lens_gpu_filtered, 
+                                                block_table=block_tables_gpu_filtered, 
+                                                softmax_scale=self.scale, causal=True)
+                    
+                    # Copy GPU results to output tensor
+                    for idx, batch_i in enumerate(gpu_indices):
+                        o[batch_i] = o_gpu[idx]
             
             
                     # Process CPU sequences (if any) - synchronouslys
@@ -347,14 +348,15 @@ class Attention(nn.Module):
                 torch.cuda.synchronize()
 
                 if profile_this_call:
-                    self.profiler.step()
+                    #self.profiler.step()
+                    pass
                 #print(o.dtype)
 
         if profile_this_call:
             #print(f"gpu_indices: {gpu_indices}")
             #print(f"cpu_indices: {cpu_indices}")
             trace_path =  self.profile_trace_path
-            self._export_trace(trace_path)
+            #self._export_trace(trace_path)
             #print(f"current cache locations: {context.cache_locations}")
             # Disable after one capture unless explicitly re-armed.
             self.profile_step = None
@@ -365,11 +367,12 @@ class Attention(nn.Module):
         do attention for only 1 seq
         q: [1, num_heads (16), head_dim (128)]
         k_cache_cpu: [seq_len, num_heads (8), head_dim(128)]
-        output: [hum_heads, head_dim], no flatten now
+        output: [1, num_heads, head_dim], no flatten now
         """
         # extract k and v from cache
         # Verify shapes match expectations
-        assert q.shape == (16, 128)
+        # qwen 0.6/4B: head_dim=16; qwen 8B: head_dim=32
+        assert q.shape in {(32, 128), (16, 128)} 
         assert k_cache.shape[1] == 8  # Or is it [1, seq_len, 8, 128]?
         num_q_heads = q.shape[-2]
         head_dim = q.shape[-1]
@@ -377,9 +380,21 @@ class Attention(nn.Module):
 
         num_groups = num_q_heads // num_kv_heads # should be 2
 
-        assert num_groups == 2
+        # qwen 0.6/4B: 2 in 1; qwen 8B: 4 in 1
+        assert num_groups in {2,4}
         assert k_cache.shape[-1] == v_cache.shape[-1] == head_dim
+        
+        # [total_len, num_heads, head_dim] -> [num_heads, total_len, head_dim]
+        k = k_cache.transpose(-3, -2)
+        v = v_cache.transpose(-3, -2)
+        q = q.unsqueeze(1)
+        o = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False, scale=softmax_scale, enable_gqa=True)
+        # should return [num_heads, 1, head_dim]
+        assert o.shape == (num_q_heads, 1, head_dim)
+        o = o.reshape(1, num_q_heads, head_dim)
+        return o
 
+        """
         # Reshape Q for grouped attention
         # [1, 16, 128] -> [8, 2, 128]
         q = q.view(num_kv_heads, num_groups, head_dim)
@@ -401,6 +416,23 @@ class Attention(nn.Module):
         output = torch.matmul(attn_weights, v)
         
         # Reshape output
-        # [8, 2, 128] -> [16, 128]
+        # [8, 2, 128] -> [1, 16, 128]
         output = output.reshape(1, num_q_heads, head_dim)
         return output
+        """
+    def run_decode_attention(self, output: torch.Tensor) -> None:
+        torch.ops.sgl_kernel.decode_attention_cpu(
+            q,
+            k_buffer,
+            v_buffer,
+            output,
+            key,
+            value,
+            loc,
+            attn_logits,
+            req_to_token,
+            b_req_idx,
+            b_seq_len,
+            sm_scale,
+            logit_cap,
+        )
